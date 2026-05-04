@@ -13,6 +13,7 @@ import format
 import sequtils
 import blog
 import asciigraph
+import std/math
 from terminal import setCursorXPos
 
 const fgDarkColor = fgWhite
@@ -37,6 +38,8 @@ type
     quit: bool
     hist: int
     blog: string
+    graphHeight: int
+    autoScale: bool
     broken: bool
     refresh: bool
 
@@ -190,8 +193,9 @@ proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
     for i in 0..<data.len:
       data[i] += 0.01
   try:
-    let gLines = plot(data, width = graphWidth, height = 4).split("\n")
-    y += 5 - gLines.len
+    let plotYMin = if tui.autoScale: NaN else: 0.0
+    let gLines = plot(data, width = graphWidth, height = tui.graphHeight, yMin = plotYMin).split("\n")
+    y += (tui.graphHeight + 1) - gLines.len
     for i, g in gLines:
       tb.setCursorPos offset-1, y+i
       tb.write g
@@ -253,6 +257,8 @@ proc help(tui: Tui, tb: var TerminalBuffer, w, h, cnt: int) =
   else:
     tb.write " ", HelpCol, "L", fgNone, " - live "
   tb.write " ", HelpCol, "Esc,Q", fgNone, " - quit "
+  tb.write " ", HelpCol, "+/-", fgNone, " - graph size"
+  tb.write " ", HelpCol, "A", fgNone, " - scale"
 
   let x = tb.getCursorXPos()
 
@@ -455,6 +461,9 @@ proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
     of Key.K:
       tui.kernel = not tui.kernel
       tui.draw = true
+    of Key.A:
+      tui.autoScale = not tui.autoScale
+      tui.draw = true
     of Key.L: tui.forceLive = not tui.forceLive; tui.reload = true
     of Key.Slash: tui.filter = some(""); tui.draw = true
     of Key.LeftBracket:
@@ -475,6 +484,12 @@ proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
       if not tui.forceLive:
         (tui.blog, tui.hist) = moveBlog(+1, tui.blog, stats.len, stats.len)
       tui.reload = true
+    of Key.Plus:
+      if tui.graphHeight < 40: inc tui.graphHeight
+      tui.draw = true
+    of Key.Minus:
+      if tui.graphHeight > 4: dec tui.graphHeight
+      tui.draw = true
     else: discard
   else:
     case key
@@ -587,7 +602,7 @@ proc tui*() =
   if getCfg().light:
     fgColor = fgLightColor
 
-  var tui = Tui(sort: Cpu)
+  var tui = Tui(sort: Cpu, graphHeight: 4, autoScale: true)
   (tui.blog, tui.hist) = moveBlog(0, tui.blog, tui.hist, 0)
   var live = newSeq[StatV2]()
   var (info, stats, broken) = hist(tui.hist, tui.blog, live, tui.forceLive)
