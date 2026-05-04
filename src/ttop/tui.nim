@@ -37,6 +37,7 @@ type
     quit: bool
     hist: int
     blog: string
+    broken: bool
     refresh: bool
 
 proc stopTui() {.noconv.} =
@@ -199,7 +200,10 @@ proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
         tb.writeR "LIVE"
         tb.write bgNone
       else:
-        tb.writeR blog
+        if tui.broken:
+          tb.writeR "corrupted " & blog
+        else:
+          tb.writeR blog
   except CatchableError, Defect:
     tb.write("error in graph: " & $deduplicate(data))
     tb.setCursorPos offset, tb.getCursorYPos() + 1
@@ -507,7 +511,7 @@ proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
     else: discard
 
 
-proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2]) =
+proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2], broken: var bool) =
   if tui.refresh:
     tui.reload = true
 
@@ -515,12 +519,13 @@ proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2]) 
     if tui.hist == 0:
       tui.blog = moveBlog(+1, tui.blog, stats.len, stats.len)[0]
     if tui.refresh:
-      (info, stats) = hist(tui.hist, tui.blog, live, tui.forceLive)
+      (info, stats, broken) = hist(tui.hist, tui.blog, live, tui.forceLive)
       tui.refresh = false
     else:
-      (info, stats) = histNoLive(tui.hist, tui.blog)
+      (info, stats, broken) = histNoLive(tui.hist, tui.blog)
     tui.reload = false
     tui.draw = true
+    tui.broken = broken
 
   if tui.draw:
     tui.redraw(info, stats, live)
@@ -574,11 +579,12 @@ proc tui*() =
   var tui = Tui(sort: Cpu)
   (tui.blog, tui.hist) = moveBlog(0, tui.blog, tui.hist, 0)
   var live = newSeq[StatV2]()
-  var (info, stats) = hist(tui.hist, tui.blog, live, tui.forceLive)
+  var (info, stats, broken) = hist(tui.hist, tui.blog, live, tui.forceLive)
+  tui.broken = broken
   tui.redraw(info, stats, live)
 
   for key in keyEachTimeout(getCfg().refreshTimeout):
     tui.processKey(key, stats)
     if tui.quit:
       break
-    tui.postProcess(info, stats, live)
+    tui.postProcess(info, stats, live, broken)
