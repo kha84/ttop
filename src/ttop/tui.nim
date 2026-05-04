@@ -156,21 +156,26 @@ proc header(tui: Tui, tb: var TerminalBuffer, info: FullInfoRef, cnt: int,
       tb.write fgCyan, k, fgColor, " ", formatS(net.netInDiff,
           net.netOutDiff)
 
-proc graphData(stats, live: seq[StatV2], sort: SortField, width: int, isLive: bool): seq[float] =
+proc graphData(stats, live: seq[StatV2], sort: SortField, width: int, isLive: bool,
+    refreshMs: int): (seq[float], string) =
+
   let data = if isLive: live else: stats
+  let refreshSec = refreshMs.float / 1000.0
 
   case sort:
-    of Cpu: result = data.mapIt(it.cpu)
-    of Mem: result = data.mapIt(int(it.memTotal - it.memAvailable).formatSPair()[0])
-    of Io: result = data.mapIt(float(it.io))
-    else: result = data.mapIt(float(it.prc))
+    of Cpu: result[0] = data.mapIt(it.cpu)
+    of Mem: result[0] = data.mapIt(int(it.memTotal - it.memAvailable).formatSPair()[0])
+    of Io:
+      result[0] = data.mapIt(float(it.io) / 1024.0 / refreshSec)
+      result[1] = "KB/s"
+    else: result[0] = data.mapIt(float(it.prc))
 
   if isLive:
-    if result.len > width:
-      result = result[^width..^1]
-    elif result.len < width:
+    if result[0].len > width:
+      result[0] = result[0][^width..^1]
+    elif result[0].len < width:
       let diff = width - data.len
-      result.insert(float(0).repeat(diff), 0)
+      result[0].insert(float(0).repeat(diff), 0)
 
 proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
     blog: string) =
@@ -179,7 +184,11 @@ proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
   tb.setCursorPos offset, y
   let w = terminalWidth()
   let graphWidth = w - 12
-  let data = graphData(stats, live, tui.sort, graphWidth, tui.forceLive or stats.len == 0)
+  var (data, label) = graphData(stats, live, tui.sort, graphWidth,
+      tui.forceLive or stats.len == 0, getCfg().refreshTimeout)
+  if data.len > 0 and min(data) == max(data):
+    for i in 0..<data.len:
+      data[i] += 0.01
   try:
     let gLines = plot(data, width = graphWidth, height = 4).split("\n")
     y += 5 - gLines.len
@@ -204,6 +213,8 @@ proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
           tb.writeR "corrupted " & blog
         else:
           tb.writeR blog
+    if label.len > 0:
+      tb.write " ", styleDim, label, fgNone
   except CatchableError, Defect:
     tb.write("error in graph: " & $deduplicate(data))
     tb.setCursorPos offset, tb.getCursorYPos() + 1

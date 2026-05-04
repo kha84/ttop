@@ -387,24 +387,27 @@ proc diskInfo*(): OrderedTableRef[string, Disk] =
 
   catchErr(file2, PROCFS / "diskstats"):
     for line in lines(file2):
-      var tmp, read, write, total: int
+      var tmp, read, write: int
       var name: string
       doAssert scanf(line, "$s$i $s$i ${devName} $i $i $i $i $i $i $i $i $i $i",
-          tmp, tmp, name, tmp, tmp, tmp, read, tmp, tmp, tmp, write, tmp, total)
+          tmp, tmp, name, tmp, tmp, read, tmp, tmp, tmp, write, tmp, tmp, tmp)
 
-      if name notin result:
+      let key = if name in result: name
+                elif ("/dev/" & name) in result: "/dev/" & name
+                else: ""
+      if key == "":
         continue
 
-      let io = SECTOR * total.uint
-      result[name].io = io
-      result[name].ioUsage = checkedSub(io, prevInfo.disk.getOrDefault(name).io)
       let ioRead = SECTOR * read.uint
-      result[name].ioRead = ioRead
-      result[name].ioUsageRead = checkedSub(ioRead, prevInfo.disk.getOrDefault(name).ioRead)
+      result[key].ioRead = ioRead
+      result[key].ioUsageRead = checkedSub(ioRead, prevInfo.disk.getOrDefault(key).ioRead)
       let ioWrite = SECTOR * write.uint
-      result[name].ioWrite = ioWrite
-      result[name].ioUsageWrite = checkedSub(ioWrite,
-          prevInfo.disk.getOrDefault(name).ioWrite)
+      result[key].ioWrite = ioWrite
+      result[key].ioUsageWrite = checkedSub(ioWrite,
+          prevInfo.disk.getOrDefault(key).ioWrite)
+      let io = ioRead + ioWrite
+      result[key].io = io
+      result[key].ioUsage = checkedSub(io, prevInfo.disk.getOrDefault(key).io)
 
   return result
 
