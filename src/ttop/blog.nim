@@ -10,6 +10,7 @@ import os
 import sequtils
 import algorithm
 import jsony
+import strutils
 
 type StatV1* = object
   prc*: int
@@ -23,6 +24,8 @@ type StatV2* = object
   memTotal*: uint
   memAvailable*: uint
   io*: uint
+  netIn*: uint
+  netOut*: uint
 
 proc toStatV2(a: StatV1): StatV2 =
   result.prc = a.prc
@@ -47,12 +50,20 @@ proc genStat(f: FullInfoRef): StatV2 =
   for _, disk in f.disk:
     io += disk.ioUsageRead + disk.ioUsageWrite
 
+  var netIn: uint = 0
+  var netOut: uint = 0
+  for _, net in f.net:
+    netIn += net.netInDiff
+    netOut += net.netOutDiff
+
   StatV2(
     prc: f.pidsInfo.len,
     cpu: f.cpu.cpu,
     memTotal: f.mem.MemTotal,
     memAvailable: f.mem.MemAvailable,
-    io: io
+    io: io,
+    netIn: netIn,
+    netOut: netOut
   )
 
 proc saveStat*(s: FileStream, f: FullInfoRef) =
@@ -62,6 +73,8 @@ proc saveStat*(s: FileStream, f: FullInfoRef) =
   s.write sz.uint32
   s.writeData stat.addr, sz
 
+const STATV2_OLD_SIZE = sizeof(StatV2) - 2 * sizeof(uint)
+
 proc stat(s: FileStream): StatV2 =
   let sz = s.readUInt32().int
   var rsz: int
@@ -69,6 +82,11 @@ proc stat(s: FileStream): StatV2 =
   of sizeof(StatV2):
     rsz = s.readData(result.addr, sizeof(StatV2))
     doAssert sz == rsz
+  of STATV2_OLD_SIZE:
+    var buf = newSeq[byte](STATV2_OLD_SIZE)
+    rsz = s.readData(buf[0].addr, STATV2_OLD_SIZE)
+    doAssert sz == rsz
+    copyMem(result.addr, buf[0].addr, STATV2_OLD_SIZE)
   of sizeof(StatV1):
     var sv1: StatV1
     rsz = s.readData(sv1.addr, sizeof(StatV1))
@@ -84,13 +102,17 @@ proc infoFromGzip(buf: string): FullInfo =
   except JsonError:
     return to[FullInfo](jsonStr)
 
-proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (FullInfoRef, seq[StatV2], bool) =
+type NetHistory* = OrderedTableRef[string, tuple[inData: seq[uint], outData: seq[uint]]]
+
+proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (FullInfoRef, seq[StatV2], bool, NetHistory) =
   let fi = fullInfo()
   if ii == 0 or forceLive:
     result[0] = fi
   live.add genStat(fi)
 
   live.delete((0..live.high - 1000))
+
+  result[3] = newOrderedTable[string, tuple[inData: seq[uint], outData: seq[uint]]]()
 
   let s = newFileStream(blog)
   if s == nil:
@@ -105,9 +127,17 @@ proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (Full
       let sz = s.readUInt32().int
       buf = s.readStr(sz)
       discard s.readUInt32()
+      let info = infoFromGzip(buf)
+      for ifName, netInfo in info.net:
+        if ifName.startsWith("veth"):
+          continue
+        if ifName notin result[3]:
+          result[3][ifName] = (newSeq[uint](), newSeq[uint]())
+        result[3][ifName].inData.add(netInfo.netInDiff)
+        result[3][ifName].outData.add(netInfo.netOutDiff)
       if not forceLive and ii == result[1].len:
         new(result[0])
-        result[0][] = infoFromGzip(buf)
+        result[0][] = info
   except CatchableError:
     result[2] = true
 
@@ -115,13 +145,13 @@ proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (Full
     if result[1].len > 0:
       new(result[0])
       result[0][] = infoFromGzip(buf)
-
     else:
       result[0] = fullInfo()
 
-proc histNoLive*(ii: int, blog: string): (FullInfoRef, seq[StatV2], bool) =
+proc histNoLive*(ii: int, blog: string): (FullInfoRef, seq[StatV2], bool, NetHistory) =
   var live = newSeq[StatV2]()
-  hist(ii, blog, live, false)
+  let (info, stats, broken, netHistory) = hist(ii, blog, live, false)
+  result = (info, stats, broken, netHistory)
 
 proc saveBlog(): string =
   let dir = getCfg().path
@@ -160,7 +190,7 @@ proc moveBlog*(d: int, b: string, hist, cnt: int): (string, int) =
 
 proc save*(): FullInfoRef =
   var lastBlog = moveBlog(0, "", 0, 0)[0]
-  var (prev, _, broken) = histNoLive(-1, lastBlog)
+  var (prev, _, broken, _) = histNoLive(-1, lastBlog)
   if broken:
     echo lastBlog, " is corrupted"
   result = if prev == nil: fullInfo() else: fullInfo(prev)

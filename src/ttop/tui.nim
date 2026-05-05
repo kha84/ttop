@@ -39,6 +39,7 @@ type
     blog: string
     broken: bool
     refresh: bool
+    netIf: string
 
 proc stopTui() {.noconv.} =
   illwillDeinit()
@@ -69,6 +70,12 @@ proc temp(tb: var TerminalBuffer, value: Option[float64], isLimit: bool) =
       tb.write fgBlue, styleBright
     tb.writeR formatC(value.get), -1
     tb.write bgNone
+
+proc activeNetKeys(info: FullInfoRef): seq[string] =
+  for k, v in info.net:
+    if v.netIn == 0 and v.netOut == 0:
+      continue
+    result.add k
 
 proc header(tui: Tui, tb: var TerminalBuffer, info: FullInfoRef, cnt: int,
     blog: string) =
@@ -152,34 +159,125 @@ proc header(tui: Tui, tb: var TerminalBuffer, info: FullInfoRef, cnt: int,
     for i, k in netRow:
       if i > 0:
         tb.write " | "
+      if tui.sort == Net and k == tui.netIf:
+        tb.write bgBlue, fgCyan, k, bgNone, fgColor, " "
+      else:
+        tb.write fgCyan, k, fgColor, " "
       let net = info.net[k]
-      tb.write fgCyan, k, fgColor, " ", formatS(net.netInDiff,
-          net.netOutDiff)
+      tb.write formatS(net.netInDiff, net.netOutDiff)
 
-proc graphData(stats, live: seq[StatV2], sort: SortField, width: int, isLive: bool): seq[float] =
+proc graphData(stats, live: seq[StatV2], sort: SortField, width: int, isLive: bool,
+    refreshMs: int, netIf: string = ""): (seq[float], string) =
+
   let data = if isLive: live else: stats
+  let refreshSec = refreshMs.float / 1000.0
 
   case sort:
-    of Cpu: result = data.mapIt(it.cpu)
-    of Mem: result = data.mapIt(int(it.memTotal - it.memAvailable).formatSPair()[0])
-    of Io: result = data.mapIt(float(it.io))
-    else: result = data.mapIt(float(it.prc))
+    of Cpu: result[0] = data.mapIt(it.cpu)
+    of Mem: result[0] = data.mapIt(int(it.memTotal - it.memAvailable).formatSPair()[0])
+    of Io:
+      result[0] = data.mapIt(float(it.io) / 1024.0 / refreshSec)
+      result[1] = "KB/s"
+    of Net:
+      result[0] = data.mapIt(float(it.netIn + it.netOut) / 1024.0 / refreshSec)
+      result[1] = netIf & " ↕KB/s"
+    else: result[0] = data.mapIt(float(it.prc))
 
   if isLive:
-    if result.len > width:
-      result = result[^width..^1]
-    elif result.len < width:
+    if result[0].len > width:
+      result[0] = result[0][^width..^1]
+    elif result[0].len < width:
       let diff = width - data.len
-      result.insert(float(0).repeat(diff), 0)
+      result[0].insert(float(0).repeat(diff), 0)
+
+proc graphNet(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
+    blog: string, y: var int, netHistory: NetHistory, info: FullInfoRef) =
+  let w = terminalWidth()
+  let graphWidth = w - 12
+  let isLive = tui.forceLive or stats.len == 0
+  let refreshSec = getCfg().refreshTimeout.float / 1000.0
+  let netIf = tui.netIf
+
+  var rxData: seq[float]
+  var txData: seq[float]
+
+  if netHistory != nil and netIf.len > 0 and netIf in netHistory:
+    let inData = netHistory[netIf].inData
+    let outData = netHistory[netIf].outData
+    rxData = inData.mapIt(float(it) / 1024.0 / refreshSec)
+    txData = outData.mapIt(float(it) / 1024.0 / refreshSec)
+  elif isLive and info != nil and netIf.len > 0 and netIf in info.net:
+    let netInfo = info.net[netIf]
+    rxData = live.mapIt(float(netInfo.netInDiff) / 1024.0 / refreshSec)
+    txData = live.mapIt(float(netInfo.netOutDiff) / 1024.0 / refreshSec)
+  else:
+    rxData = newSeq[float]()
+    txData = newSeq[float]()
+
+  if isLive:
+    if rxData.len > graphWidth:
+      rxData = rxData[^graphWidth..^1]
+      txData = txData[^graphWidth..^1]
+    elif rxData.len < graphWidth:
+      let diff = graphWidth - rxData.len
+      rxData.insert(float(0).repeat(diff), 0)
+      txData.insert(float(0).repeat(diff), 0)
+
+  for idx, ser in [(rxData, netIf & " ↓KB/s"), (txData, netIf & " ↑KB/s")]:
+    var dd = ser[0]
+    if dd.len > 0 and min(dd) == max(dd):
+      for i in 0..<dd.len:
+        dd[i] += 0.01
+    try:
+      let gLines = plot(dd, width = graphWidth, height = 2).split("\n")
+      let startY = y
+      y += gLines.len + 1
+      for i, g in gLines:
+        tb.setCursorPos offset-1, startY+i
+        tb.write g
+      tb.setCursorPos offset, y-1
+      tb.write styleDim, ser[1], fgNone
+    except CatchableError, Defect:
+      tb.setCursorPos offset, y
+      tb.write "error in net graph"
+      inc y
+
+  if tui.hist > 0 and not tui.forceLive:
+    let cc = if rxData.len > 2: rxData.len - 1 else: 1
+    let x = ((tui.hist-1) * (w-11-2)) div (cc)
+    tb.setCursorPos offset + 8 + x, y
+    tb.write styleBright, "^"
+  else:
+    tb.setCursorPos offset, y
+    if isLive:
+      if stats.len == 0:
+        tb.writeR("No historical stats found ", 5)
+      tb.write bgGreen
+      tb.writeR "LIVE"
+      tb.write bgNone
+    else:
+      if tui.broken:
+        tb.writeR "corrupted " & blog
+      else:
+        tb.writeR blog
 
 proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
-    blog: string) =
+    blog: string, netHistory: NetHistory, info: FullInfoRef) =
   tb.setCursorPos offset, tb.getCursorYPos()+1
   var y = tb.getCursorYPos() + 1
   tb.setCursorPos offset, y
   let w = terminalWidth()
   let graphWidth = w - 12
-  let data = graphData(stats, live, tui.sort, graphWidth, tui.forceLive or stats.len == 0)
+
+  if tui.sort == Net:
+    tui.graphNet(tb, stats, live, blog, y, netHistory, info)
+    return
+
+  var (data, label) = graphData(stats, live, tui.sort, graphWidth,
+      tui.forceLive or stats.len == 0, getCfg().refreshTimeout)
+  if data.len > 0 and min(data) == max(data):
+    for i in 0..<data.len:
+      data[i] += 0.01
   try:
     let gLines = plot(data, width = graphWidth, height = 4).split("\n")
     y += 5 - gLines.len
@@ -204,6 +302,8 @@ proc graph(tui: Tui, tb: var TerminalBuffer, stats, live: seq[StatV2],
           tb.writeR "corrupted " & blog
         else:
           tb.writeR blog
+    if label.len > 0:
+      tb.write " ", styleDim, label, fgNone
   except CatchableError, Defect:
     tb.write("error in graph: " & $deduplicate(data))
     tb.setCursorPos offset, tb.getCursorYPos() + 1
@@ -221,9 +321,15 @@ proc help(tui: Tui, tb: var TerminalBuffer, w, h, cnt: int) =
   tb.write fgNone
   for x in SortField:
     if x == tui.sort:
-      tb.write " ", styleBright, fgNone, $x
+      if x == Net:
+        tb.write " ", styleBright, fgNone, "Net"
+      else:
+        tb.write " ", styleBright, fgNone, $x
     else:
-      tb.write " ", HelpCol, $($x)[0], fgCyan, ($x)[1..^1]
+      if x == Net:
+        tb.write " N", HelpCol, "e", fgCyan, "t"
+      else:
+        tb.write " ", HelpCol, $($x)[0], fgCyan, ($x)[1..^1]
 
   if tui.group:
     tb.write "  ", styleBright, fgNone
@@ -301,9 +407,11 @@ proc table(tui: Tui, tb: var TerminalBuffer, pi: OrderedTableRef[uint, PidInfo],
   tb.write fmt""" {"CPU%":>5}"""
   if tui.sort == IO: tb.write resetStyle else: tb.write styleDim
   tb.write fmt""" {"r/w IO":>9}"""
+  if tui.sort == Net: tb.write resetStyle else: tb.write styleDim
+  tb.write fmt""" {"NET":>5}"""
   tb.write styleDim, fmt""" {"UP":>8} {"THR":>3}"""
-  if tb.width - 67 > 0:
-    tb.write ' '.repeat(tb.width-67), bgNone
+  if tb.width - 74 > 0:
+    tb.write ' '.repeat(tb.width-74), bgNone
   inc y
   var i = 0
   tb.setStyle {}
@@ -345,6 +453,10 @@ proc table(tui: Tui, tb: var TerminalBuffer, pi: OrderedTableRef[uint, PidInfo],
     if p.ioReadDiff + p.ioWriteDiff > 0:
       rwStr = fmt"{formatSI(p.ioReadDiff, p.ioWriteDiff)}"
     tb.write " ", rwStr.cut(9, true, tui.scrollX)
+    var netStr = ""
+    if p.netSocksTcp + p.netSocksUdp > 0:
+      netStr = fmt"{p.netSocksTcp}/{p.netSocksUdp}"
+    tb.write " ", netStr.cut(5, true, tui.scrollX)
 
     tb.write " ", p.uptime.formatT().cut(8, false, tui.scrollX)
 
@@ -359,7 +471,7 @@ proc table(tui: Tui, tb: var TerminalBuffer, pi: OrderedTableRef[uint, PidInfo],
       cmd.add p.cmd
     else:
       cmd.add p.name
-    tb.write fgCyan, cmd.cut(tb.width - 67 - lvl - p.docker.len - 2, false,
+    tb.write fgCyan, cmd.cut(tb.width - 74 - lvl - p.docker.len - 2, false,
         tui.scrollX), fgColor
 
     inc y
@@ -375,7 +487,7 @@ proc showFilter(tui: Tui, tb: var TerminalBuffer, cnt: int) =
   tb.write " ", HelpCol, "Esc", fgNone, ",", HelpCol, "Ret", fgNone, " - Back "
   tb.write " Filter: ", bgBlue, tui.filter.get(), bgNone
 
-proc redraw(tui: Tui, info: FullInfoRef, stats, live: seq[StatV2]) =
+proc redraw(tui: Tui, info: FullInfoRef, stats, live: seq[StatV2], netHistory: NetHistory) =
   let (w, h) = terminalSize()
   var tb = newTerminalBuffer(w, h)
 
@@ -390,7 +502,7 @@ proc redraw(tui: Tui, info: FullInfoRef, stats, live: seq[StatV2]) =
 
   let blogShort = extractFilename tui.blog
   tui.header(tb, info, stats.len, blogShort)
-  tui.graph(tb, stats, live, blogShort)
+  tui.graph(tb, stats, live, blogShort, netHistory, info)
   let pidsInfo =
     if tui.group:
       info.pidsInfo.group(tui.kernel)
@@ -404,7 +516,7 @@ proc redraw(tui: Tui, info: FullInfoRef, stats, live: seq[StatV2]) =
     tui.help(tb, w, h, stats.len)
   tb.display()
 
-proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
+proc processKey(tui: Tui, key: Key, stats: var seq[StatV2], info: FullInfoRef) =
   if key == Key.None:
     tui.refresh = true
     return
@@ -433,6 +545,21 @@ proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
     of Key.I: tui.sort = Io; tui.draw = true
     of Key.N: tui.sort = Name; tui.draw = true
     of Key.C: tui.sort = Cpu; tui.draw = true
+    of Key.E:
+      let keys = activeNetKeys(info)
+      if tui.sort != Net:
+        tui.sort = Net
+        if keys.len > 0:
+          tui.netIf = keys[0]
+      else:
+        let idx = keys.find(tui.netIf)
+        if keys.len == 0:
+          discard
+        elif idx < 0 or idx >= keys.high:
+          tui.netIf = keys[0]
+        else:
+          tui.netIf = keys[idx + 1]
+      tui.draw = true
     of Key.T:
       tui.threads = not tui.threads
       if tui.threads: tui.group = false
@@ -511,7 +638,7 @@ proc processKey(tui: Tui, key: Key, stats: var seq[StatV2]) =
     else: discard
 
 
-proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2], broken: var bool) =
+proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2], broken: var bool, netHistory: var NetHistory) =
   if tui.refresh:
     tui.reload = true
 
@@ -519,16 +646,16 @@ proc postProcess(tui: Tui, info: var FullInfoRef, stats, live: var seq[StatV2], 
     if tui.hist == 0:
       tui.blog = moveBlog(+1, tui.blog, stats.len, stats.len)[0]
     if tui.refresh:
-      (info, stats, broken) = hist(tui.hist, tui.blog, live, tui.forceLive)
+      (info, stats, broken, netHistory) = hist(tui.hist, tui.blog, live, tui.forceLive)
       tui.refresh = false
     else:
-      (info, stats, broken) = histNoLive(tui.hist, tui.blog)
+      (info, stats, broken, netHistory) = histNoLive(tui.hist, tui.blog)
     tui.reload = false
     tui.draw = true
     tui.broken = broken
 
   if tui.draw:
-    tui.redraw(info, stats, live)
+    tui.redraw(info, stats, live, netHistory)
     tui.draw = false
 
 iterator keyEachTimeout(refreshTimeout: int = 1000): Key =
@@ -579,12 +706,12 @@ proc tui*() =
   var tui = Tui(sort: Cpu)
   (tui.blog, tui.hist) = moveBlog(0, tui.blog, tui.hist, 0)
   var live = newSeq[StatV2]()
-  var (info, stats, broken) = hist(tui.hist, tui.blog, live, tui.forceLive)
+  var (info, stats, broken, netHistory) = hist(tui.hist, tui.blog, live, tui.forceLive)
   tui.broken = broken
-  tui.redraw(info, stats, live)
+  tui.redraw(info, stats, live, netHistory)
 
   for key in keyEachTimeout(getCfg().refreshTimeout):
-    tui.processKey(key, stats)
+    tui.processKey(key, stats, info)
     if tui.quit:
       break
-    tui.postProcess(info, stats, live, broken)
+    tui.postProcess(info, stats, live, broken, netHistory)
