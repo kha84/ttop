@@ -3,11 +3,12 @@ import config
 
 import os
 import strutils
-from posix import Uid, getpwuid
+from posix import Uid, getpwuid, readlink
 import posix_utils
 import nativesockets
 import times
 import tables
+import sets
 import algorithm
 import strscans
 import options
@@ -25,7 +26,7 @@ type ParseInfoError* = object of ValueError
   file*: string
 
 type SortField* = enum
-  Cpu, Mem, Io, Pid, Name
+  Cpu, Mem, Io, Net, Pid, Name
 
 type MemInfo* = object
   MemTotal*: uint
@@ -54,8 +55,7 @@ type PidInfo* = object
   uptime*: uint
   ioRead*, ioWrite*: uint
   ioReadDiff*, ioWriteDiff*: uint
-  netIn*, netOut*: uint
-  netInDiff*, netOutDiff*: uint
+  netSocksTcp*, netSocksUdp*: int
   parents*: seq[uint] # generated from ppid, used to build tree
   threads*: int
   isKernel*: bool
@@ -83,7 +83,7 @@ type Disk* = object
   ioUsageWrite*: uint
   path*: string
 
-type Net = object
+type NetInfo* = object
   netIn*: uint
   netInDiff*: uint
   netOut*: uint
@@ -102,7 +102,7 @@ type FullInfo* = object
   mem*: MemInfo
   pidsInfo*: PidsTable
   disk*: OrderedTableRef[string, Disk]
-  net*: OrderedTableRef[string, Net]
+  net*: OrderedTableRef[string, NetInfo]
   temp*: Temp
   # power*: uint
 
@@ -121,7 +121,7 @@ proc newFullInfo(): FullInfoRef =
   new(result)
   result.pidsInfo = newOrderedTable[uint, procfs.PidInfo]()
   result.disk = newOrderedTable[string, Disk]()
-  result.net = newOrderedTable[string, Net]()
+  result.net = newOrderedTable[string, NetInfo]()
 
 proc fullInfo*(prev: FullInfoRef = nil): FullInfoRef
 
@@ -275,6 +275,53 @@ proc parseCmd(pid: uint): string =
   except CatchableError:
     discard
 
+proc parseNetSocks(pid: uint): (int, int) =
+  let fdDir = PROCFS / $pid / "fd"
+  var socketInodes: seq[uint]
+  try:
+    for kind, path in walkDir(fdDir):
+      var buf = newString(256)
+      let len = readlink(path.cstring, cast[cstring](buf[0].addr), 255)
+      if len <= 0:
+        continue
+      buf.setLen(len)
+      if buf.startsWith("socket:["):
+        var inode: int
+        if scanf(buf, "socket:[$i]", inode):
+          socketInodes.add inode.uint
+  except CatchableError:
+    return (0, 0)
+  if socketInodes.len == 0:
+    return (0, 0)
+  var tcpSet = initHashSet[uint]()
+  var udpSet = initHashSet[uint]()
+  proc loadInodes(path: string, target: var HashSet[uint]) =
+    try:
+      for line in lines(path):
+        var fields = line.splitWhitespace()
+        if fields.len >= 10:
+          var inode: int
+          try:
+            inode = parseInt(fields[9])
+          except ValueError:
+            continue
+          if inode > 0:
+            target.incl inode.uint
+    except CatchableError:
+      discard
+  loadInodes(PROCFS / $pid / "net/tcp", tcpSet)
+  loadInodes(PROCFS / $pid / "net/tcp6", tcpSet)
+  loadInodes(PROCFS / $pid / "net/udp", udpSet)
+  loadInodes(PROCFS / $pid / "net/udp6", udpSet)
+  var tcp = 0
+  var udp = 0
+  for inode in socketInodes:
+    if inode in tcpSet:
+      inc tcp
+    elif inode in udpSet:
+      inc udp
+  (tcp, udp)
+
 proc devName(s: string, o: var string, off: int): int =
   while off+result < s.len:
     let c = s[off+result]
@@ -309,6 +356,9 @@ proc parsePid(pid: uint, uptimeHz: uint, mem: MemInfo,
       raise
   result.cmd = parseCmd(pid)
   result.docker = parseDocker(pid, hasDocker)
+  let (tcpSocks, udpSocks) = parseNetSocks(pid)
+  result.netSocksTcp = tcpSocks
+  result.netSocksUdp = udpSocks
 
 iterator pids*(): uint =
   catchErr(dir, PROCFS):
@@ -411,8 +461,8 @@ proc diskInfo*(): OrderedTableRef[string, Disk] =
 
   return result
 
-proc netInfo(): OrderedTableRef[string, Net] =
-  result = newOrderedTable[string, Net]()
+proc netInfo*(): OrderedTableRef[string, NetInfo] =
+  result = newOrderedTable[string, NetInfo]()
   catchErr(file, PROCFS / "net/dev"):
     var i = 0
     for line in lines(file):
@@ -427,7 +477,7 @@ proc netInfo(): OrderedTableRef[string, Net] =
       if name.startsWith("veth"):
         continue
 
-      result[name] = Net(
+      result[name] = NetInfo(
         netIn: netIn.uint,
         netInDiff: checkedSub(netIn.uint, prevInfo.net.getOrDefault(
             name).netIn),
@@ -531,6 +581,8 @@ proc sortFunc(sortOrder: SortField, threads = false): auto =
     cmp b[1].rss, a[1].rss
   of Io: return proc(a, b: (uint, PidInfo)): int =
     cmp b[1].ioReadDiff+b[1].ioWriteDiff, a[1].ioReadDiff+a[1].ioWriteDiff
+  of Net: return proc(a, b: (uint, PidInfo)): int =
+    cmp b[1].netSocksTcp+b[1].netSocksUdp, a[1].netSocksTcp+a[1].netSocksUdp
   of Cpu: return proc(a, b: (uint, PidInfo)): int =
     cmp b[1].cpu, a[1].cpu
 
@@ -610,6 +662,8 @@ proc group*(pidsInfo: PidsTable, kernel: bool): PidsTable =
     g.cpu += pi.cpu
     g.ioReadDiff += pi.ioReadDiff
     g.ioWriteDiff += pi.ioWriteDiff
+    g.netSocksTcp += pi.netSocksTcp
+    g.netSocksUdp += pi.netSocksUdp
     g.threads += pi.threads
     g.count.inc
     grpInfo[id] = g
