@@ -296,7 +296,7 @@ proc printProcesses*(path: string) =
   defer: s.close()
 
   var buf: string
-  echo "timestamp\tpid\tcpu\tmem_rss_kb\tmem_vsize_kb\tmem_pct\tuser\tname\tcmd"
+  echo "timestamp\tpid\tcpu\tmem_rss_kb\tmem_vsize_kb\tmem_pct\tnet_tcp\tnet_udp\tuser\tname\tcmd"
   while not s.atEnd():
     discard s.stat()
     let sz = s.readUInt32().int
@@ -305,7 +305,7 @@ proc printProcesses*(path: string) =
     let info = infoFromGzip(buf)
     let tsStr = info.sys.datetime.format(TIME_FORMAT)
     for pid, pinfo in info.pidsInfo:
-      echo &"{tsStr}\t{pid}\t{pinfo.cpu:.2f}\t{pinfo.rss div 1024}\t{pinfo.vsize div 1024}\t{pinfo.mem:.2f}\t{pinfo.user}\t{pinfo.name}\t{pinfo.cmd}"
+      echo &"{tsStr}\t{pid}\t{pinfo.cpu:.2f}\t{pinfo.rss div 1024}\t{pinfo.vsize div 1024}\t{pinfo.mem:.2f}\t{pinfo.netSocksTcp}\t{pinfo.netSocksUdp}\t{pinfo.user}\t{pinfo.name}\t{pinfo.cmd}"
 
 type
   PartialFullInfo = object
