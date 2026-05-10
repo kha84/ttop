@@ -328,6 +328,11 @@ proc printSummary*(path: string) =
     if headerSize == sizeof(StatV2):
       if s.readData(stat.addr, sizeof(StatV2)) == sizeof(StatV2):
         headerRead = true
+    elif headerSize == STATV2_OLD_SIZE:
+      var buf = newSeq[byte](STATV2_OLD_SIZE)
+      if s.readData(buf[0].addr, STATV2_OLD_SIZE) == STATV2_OLD_SIZE:
+        copyMem(stat.addr, buf[0].addr, STATV2_OLD_SIZE)
+        headerRead = true
     elif headerSize == sizeof(StatV1):
       var sv1: StatV1
       if s.readData(sv1.addr, sizeof(StatV1)) == sizeof(StatV1):
@@ -370,7 +375,7 @@ proc printSummary*(path: string) =
   echo "Timestamp               |  Procs | CPU %  | Mem Total | Mem Avail | I/O"
   echo "------------------------+--------+--------+-----------+-----------+--------"
   for e in entries:
-    echo &"{e.ts.format(TIME_FORMAT):<24} | {e.prc:>6} | {e.cpu:>6.2f} | {e.memTotal div 1024:>9}M | {e.memAvailable div 1024:>9}M | {e.io}"
+    echo &"{e.ts.format(TIME_FORMAT):<24} | {e.prc:>6} | {e.cpu:>6.2f} | {e.memTotal div 1024 div 1024:>9}M | {e.memAvailable div 1024 div 1024:>9}M | {e.io}"
 
 
 when isMainModule:
