@@ -105,7 +105,27 @@ proc infoFromGzip(buf: string): FullInfo =
 
 type NetHistory* = OrderedTableRef[string, tuple[inData: seq[uint], outData: seq[uint]]]
 
-proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (FullInfoRef, seq[StatV2], bool, NetHistory) =
+# Full cache for a single blog file. Only one blog file is cached at a time -
+# when the user navigates to a different file the entire cache is dropped and
+# rebuilt. This avoids re-reading and re-decompressing the blog file on every
+# navigation keystroke within the same file.
+#
+# On cache hit (same blog file): stats and netHistory come from memory with zero
+# file I/O; only the single compressed JSON blob at position ii is decompressed
+# to produce the FullInfo for that snapshot.
+#
+# On cache miss (different file or first access): the entire blog file is read
+# once, all JSON blobs are decompressed, and the cache is populated.
+type BlogCache* = object
+  blog*: string               # blog filename this cache belongs to
+  stats*: seq[StatV2]         # all binary StatV2 records from the file
+  netHistory*: NetHistory     # per-interface network delta time-series
+  blobs*: seq[string]         # compressed JSON blobs (for FullInfo at position ii)
+  broken*: bool               # true if the file was corrupt / truncated
+
+var blogCache*: BlogCache
+
+proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (FullInfoRef, seq[StatV2], bool) =
   let fi = fullInfo()
   if ii == 0 or forceLive:
     result[0] = fi
@@ -113,10 +133,35 @@ proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (Full
 
   live.delete((0..live.high - 1000))
 
-  result[3] = newOrderedTable[string, tuple[inData: seq[uint], outData: seq[uint]]]()
+  # In live mode we never need the blog cache — the graph uses info.net[netIf]
+  # directly from the current fullInfo(). Return early to skip all file I/O.
+  if forceLive or ii == 0:
+    return
+
+  # Historical mode: check the cache first.
+  if blogCache.blog == blog and blogCache.stats.len > 0:
+    # Cache hit — everything is already in memory, no file I/O needed.
+    result[1] = blogCache.stats
+    result[2] = blogCache.broken
+
+    # Only decompress the single JSON blob the user is currently viewing.
+    if blogCache.blobs.len > 0:
+      if ii > 0 and ii <= blogCache.blobs.len:
+        new(result[0])
+        result[0][] = infoFromGzip(blogCache.blobs[ii - 1])
+      elif ii == -1 and blogCache.blobs.len > 0:
+        new(result[0])
+        result[0][] = infoFromGzip(blogCache.blobs[^1])
+    return
+
+  # Cache miss — read the entire blog file, decompress all records, and
+  # build the cache entries for stats, netHistory, and compressed blobs.
+  var netHistory = newOrderedTable[string, tuple[inData: seq[uint], outData: seq[uint]]]()
+  var blobs = newSeq[string]()
 
   let s = newFileStream(blog)
   if s == nil:
+    blogCache = BlogCache(blog: blog)
     return
   defer: s.close()
 
@@ -128,15 +173,16 @@ proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (Full
       let sz = s.readUInt32().int
       buf = s.readStr(sz)
       discard s.readUInt32()
+      blobs.add(buf)
       let info = infoFromGzip(buf)
       for ifName, netInfo in info.net:
         if ifName.startsWith("veth"):
           continue
-        if ifName notin result[3]:
-          result[3][ifName] = (newSeq[uint](), newSeq[uint]())
-        result[3][ifName].inData.add(netInfo.netInDiff)
-        result[3][ifName].outData.add(netInfo.netOutDiff)
-      if not forceLive and ii == result[1].len:
+        if ifName notin netHistory:
+          netHistory[ifName] = (newSeq[uint](), newSeq[uint]())
+        netHistory[ifName].inData.add(netInfo.netInDiff)
+        netHistory[ifName].outData.add(netInfo.netOutDiff)
+      if ii == result[1].len:
         new(result[0])
         result[0][] = info
   except CatchableError:
@@ -149,10 +195,20 @@ proc hist*(ii: int, blog: string, live: var seq[StatV2], forceLive: bool): (Full
     else:
       result[0] = fullInfo()
 
-proc histNoLive*(ii: int, blog: string): (FullInfoRef, seq[StatV2], bool, NetHistory) =
+  # Populate the single-blog cache for subsequent accesses.
+  # Navigating to a different blog file will cause blogCache.blog to differ,
+  # triggering a cache miss and full rebuild for the new file.
+  blogCache = BlogCache(
+    blog: blog,
+    stats: result[1],
+    netHistory: netHistory,
+    blobs: blobs,
+    broken: result[2]
+  )
+
+proc histNoLive*(ii: int, blog: string): (FullInfoRef, seq[StatV2], bool) =
   var live = newSeq[StatV2]()
-  let (info, stats, broken, netHistory) = hist(ii, blog, live, false)
-  result = (info, stats, broken, netHistory)
+  hist(ii, blog, live, false)
 
 proc saveBlog(): string =
   let dir = getCfg().path
@@ -160,9 +216,25 @@ proc saveBlog(): string =
     createDir(dir)
   os.joinPath(dir, now().format("yyyy-MM-dd")).addFileExt("blog")
 
+# Compute the next (blog file, snapshot index) pair for historical navigation.
+# d < 0 means go backwards in time (key '['), d > 0 means go forwards (key ']').
+# b is the current blog filename, hist is the current snapshot position (0 = live),
+# and cnt is the number of snapshots in the current blog file (may be 0 in live mode).
+# Returns (blog filename, new hist position).
 proc moveBlog*(d: int, b: string, hist, cnt: int): (string, int) =
-  if d < 0 and hist == 0 and cnt > 0:
-    return (b, cnt)
+  # Pressing '[' from live mode (hist == 0): navigate backwards in time.
+  if d < 0 and hist == 0:
+    if cnt > 0:
+      # Stats already loaded — we know the snapshot count of the current blog.
+      return (b, cnt)
+    else:
+      # Live mode doesn't populate stats, so cnt == 0. Read the current blog
+      # file to find its actual snapshot count. If it has snapshots, jump to
+      # the last one (e.g. 00:30) instead of skipping to the previous day's
+      # file (e.g. 23:50).
+      let actualCnt = histNoLive(-1, b)[1].len
+      if actualCnt > 0:
+        return (b, actualCnt)
   elif d < 0 and hist > 1:
     return (b, hist-1)
   elif d > 0 and hist > 0 and hist < cnt:
@@ -191,7 +263,7 @@ proc moveBlog*(d: int, b: string, hist, cnt: int): (string, int) =
 
 proc save*(): FullInfoRef =
   var lastBlog = moveBlog(0, "", 0, 0)[0]
-  var (prev, _, broken, _) = histNoLive(-1, lastBlog)
+  var (prev, _, broken) = histNoLive(-1, lastBlog)
   if broken:
     echo lastBlog, " is corrupted"
   result = if prev == nil: fullInfo() else: fullInfo(prev)
